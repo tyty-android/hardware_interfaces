@@ -24,6 +24,7 @@
 
 //#define LOG_NDEBUG 0
 
+#include <cstddef>
 #include <inttypes.h>
 #include <memory.h>
 #include <string.h>
@@ -365,6 +366,40 @@ Return<void> Device::createAudioPatch(const hidl_vec<AudioPortConfig>& sources,
     return Void();
 }
 
+namespace {
+
+struct audio_port_config_device_ext_vendor_compat {
+    audio_module_handle_t hw_module;                /* module the device is attached to */
+    audio_devices_t       type;                     /* device type (e.g AUDIO_DEVICE_OUT_SPEAKER) */
+    char                  address[AUDIO_DEVICE_MAX_ADDRESS_LEN]; /* device address. "" if N/A */
+    // Removed
+    // audio_channel_mask_t  speaker_layout_channel_mask; /* represents physical speaker layout. */
+};
+
+struct audio_port_config_vendor_compat {
+    audio_port_handle_t      id;           /* port unique ID */
+    audio_port_role_t        role;         /* sink or source */
+    audio_port_type_t        type;         /* device, mix ... */
+    unsigned int             config_mask;  /* e.g AUDIO_PORT_CONFIG_ALL */
+    unsigned int             sample_rate;  /* sampling rate in Hz */
+    audio_channel_mask_t     channel_mask; /* channel mask if applicable */
+    audio_format_t           format;       /* format if applicable */
+    struct audio_gain_config gain;         /* gain to apply if applicable */
+    union audio_io_flags     flags;        /* HW_AV_SYNC, DIRECT, ... */
+    union {
+        struct audio_port_config_device_ext_vendor_compat  device;  /* device specific info */
+        struct audio_port_config_mix_ext     mix;     /* mix specific info */
+        struct audio_port_config_session_ext session; /* session specific info */
+    } ext;
+};
+
+void audioPortConfigSystemToVendor(const audio_port_config& src, audio_port_config_vendor_compat& dst) {
+    // This is safe, since we are stripping away the last field
+    memcpy(&dst, &src, sizeof(dst));
+}
+
+}
+
 std::tuple<Result, AudioPatchHandle> Device::createOrUpdateAudioPatch(
         AudioPatchHandle patch, const hidl_vec<AudioPortConfig>& sources,
         const hidl_vec<AudioPortConfig>& sinks) {
@@ -381,9 +416,29 @@ std::tuple<Result, AudioPatchHandle> Device::createOrUpdateAudioPatch(
             status != NO_ERROR) {
             return {analyzeStatus("audioPortConfigsToHal;sinks", status), patch};
         }
+
+        ALOGI("createOrUpdateAudioPatch: shim for vendor audio_port_config");
+        auto halSourcesVendorCompat = std::make_unique<audio_port_config_vendor_compat[]>(sources.size());
+        auto halSinksVendorCompat = std::make_unique<audio_port_config_vendor_compat[]>(sinks.size());
+
+        for (size_t i = 0; i < sources.size(); ++i) {
+            audioPortConfigSystemToVendor(halSources[i], halSourcesVendorCompat[i]);
+        }
+        for (size_t i = 0; i < sinks.size(); ++i) {
+            audioPortConfigSystemToVendor(halSinks[i], halSinksVendorCompat[i]);
+        }
+
+        static_assert(sizeof(audio_port_config_vendor_compat) == 0xD8,
+                      "Vendor compat struct size mismatch!");
+        static_assert(offsetof(audio_port_config_vendor_compat, ext.device.type) == 0xB4,
+                      "Vendor compat struct layout mismatch!");
+
         retval = analyzeStatus("create_audio_patch",
-                               mDevice->create_audio_patch(mDevice, sources.size(), &halSources[0],
-                                                           sinks.size(), &halSinks[0], &halPatch));
+                               mDevice->create_audio_patch(mDevice, sources.size(),
+                                                           reinterpret_cast<audio_port_config*>(&halSourcesVendorCompat[0]),
+                                                           sinks.size(),
+                                                           reinterpret_cast<audio_port_config*>(&halSinksVendorCompat[0]),
+                                                           &halPatch));
         if (retval == Result::OK) {
             patch = static_cast<AudioPatchHandle>(halPatch);
         }
